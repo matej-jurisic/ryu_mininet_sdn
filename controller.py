@@ -27,14 +27,18 @@ from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, arp, ipv4
+from ryu.app.wsgi import WSGIApplication
+from controller_api import RyuControllerApi, api_instance_name
 
-class SmartARPController(app_manager.RyuApp):
+class RyuController(app_manager.RyuApp):
     # Koristi OpenFlow v1.3
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+
+    _CONTEXTS = {'wsgi': WSGIApplication}
     
     def __init__(self, *args, **kwargs):
         # Inicijaliziraj ryu kontroler
-        super(SmartARPController, self).__init__(*args, **kwargs)
+        super(RyuController, self).__init__(*args, **kwargs)
         
         # Mrežna topologija u obliku: IP -> (MAC, switch_id, port)
         # Koristi se za usmjeravanje ARP paketa i provjeru whiteliste između IP adresa
@@ -49,8 +53,15 @@ class SmartARPController(app_manager.RyuApp):
         self.ALLOWED_PAIRS = {
             ('10.0.0.1', '10.0.0.2'),
             ('10.0.0.2', '10.0.0.1'),
+            ('10.0.0.3', '10.0.0.4'),
+            ('10.0.0.4', '10.0.0.3'),
+            ('10.0.0.1', '10.0.0.3'),
+            ('10.0.0.3', '10.0.0.1'), 
         }
         
+        wsgi = kwargs['wsgi']
+        wsgi.register(RyuControllerApi, {api_instance_name: self})
+
         self.logger.info("Dinamički kontroler inicijaliziran.")
 
     def add_flow(self, datapath, priority, match, actions, idle_timeout=0):
@@ -149,15 +160,19 @@ class SmartARPController(app_manager.RyuApp):
         if not arp_pkt:
             return
 
-        dpid = datapath.id 
-        parser = datapath.ofproto_parser 
+        dpid = datapath.id
         src_ip = arp_pkt.src_ip 
         dst_ip = arp_pkt.dst_ip 
         src_mac = arp_pkt.src_mac
 
-        # Spremamo informacije kako je host koji šalje paket spojen u topologiju
-        self.host_info[src_ip] = (src_mac, dpid, in_port)
-        self.mac_to_port.setdefault(dpid, {})[src_mac] = in_port
+        if in_port == 3:
+            # Ne uči o hostovima s inter-switch linkova, 
+            # inače se prebrisuju ispravne informacije o lokaciji hosta
+            pass 
+        else:
+            # Spremamo informacije kako je host koji šalje paket spojen u topologiju
+            self.host_info[src_ip] = (src_mac, dpid, in_port)
+            self.mac_to_port.setdefault(dpid, {})[src_mac] = in_port
 
         self.logger.info(f"ARP: {src_ip} ({src_mac}) zahtjev prema {dst_ip}")
 
@@ -171,7 +186,16 @@ class SmartARPController(app_manager.RyuApp):
         # Ako znamo gdje je destination, pošalji tamo
         if dst_ip in self.host_info:
             dst_mac, dst_switch, dst_port = self.host_info[dst_ip]
-            self._route_packet(arp_type, datapath, in_port, pkt, dst_port)
+            
+            # KRITIČNO: Provjeri jesam li na destination switchu!
+            if dpid == dst_switch:
+                # Destination je lokalan - šalji direktno na host port
+                out_port = dst_port
+            else:
+                # Destination je na drugom switchu - šalji na inter-switch link
+                out_port = 3
+            
+            self._route_packet(arp_type, datapath, in_port, pkt, out_port)
         else:
             # U normalnoj mreži bi bio broadcast, mi odbacujemo
             self.logger.warning(f"  -> Nepoznat odredišni IP: {dst_ip}, paket se odbacuje")
@@ -194,9 +218,14 @@ class SmartARPController(app_manager.RyuApp):
         src_ip = ip_pkt.src
         dst_ip = ip_pkt.dst
         
-        # Spremamo informacije kako je host koji šalje paket spojen u topologiju
-        self.host_info[src_ip] = (src_mac, datapath.id, in_port)
-        self.mac_to_port.setdefault(datapath.id, {})[src_mac] = in_port
+        if in_port == 3:
+            # Ne uči o hostovima s inter-switch linkova, 
+            # inače se prebrisuju ispravne informacije o lokaciji hosta
+            pass 
+        else:
+            # Spremamo informacije kako je host koji šalje paket spojen u topologiju
+            self.host_info[src_ip] = (src_mac, dpid, in_port)
+            self.mac_to_port.setdefault(dpid, {})[src_mac] = in_port
 
         self.logger.info(f"IP: {src_ip} zahtjev prema {dst_ip}")
         
@@ -206,24 +235,21 @@ class SmartARPController(app_manager.RyuApp):
 
         if dst_ip in self.host_info:
             dst_mac, dst_switch, dst_port = self.host_info[dst_ip]
-            self._route_packet("IP paket", datapath, in_port, pkt, dst_port)
+            
+            # KRITIČNO: Provjeri jesam li na destination switchu!
+            if dpid == dst_switch:
+                # Destination je lokalan - šalji direktno na host port
+                out_port = dst_port
+            else:
+                # Destination je na drugom switchu - šalji na inter-switch link
+                out_port = 3
+            
+            self._route_packet("IP paket", datapath, in_port, pkt, out_port)
             self.logger.info(f"  DOZVOLJENO: IP paket između {src_ip} i {dst_ip}")
 
             # Instaliraj flow pravilo u switch za buduće pakete
             # Priority 10 > 0 (viši od table-miss pravila)
             # idle_timeout=30 znači pravilo se briše nakon 30s neaktivnosti
             match = parser.OFPMatch(eth_type=0x0800, ipv4_src=src_ip, ipv4_dst=dst_ip)
-            
-            # Odredi izlazni port
-            if dst_mac in self.mac_to_port[dpid]:
-                # Destination je na istom switchu
-                out_port = self.mac_to_port[dpid][dst_mac]
-            # Odredište spojeno na drugi switch, proslijedi paket
-            else:
-                # HARDCODED: Destination je na drugom switchu
-                # Port 3 je inter-switch link (radi SAMO za 2 switcha!)
-                # U realnoj implementaciji bi trebala routing tablica ili shortest path algoritam
-                out_port = 3
-
             actions = [parser.OFPActionOutput(out_port)]
             self.add_flow(datapath, 10, match, actions, idle_timeout=30)
